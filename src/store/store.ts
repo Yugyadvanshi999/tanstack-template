@@ -1,5 +1,6 @@
 import { Store } from '@tanstack/store'
 import type { Message } from '../utils/ai'
+import { DEFAULT_MODEL } from '../utils/models'
 
 // Types
 export interface Prompt {
@@ -14,6 +15,8 @@ export interface Conversation {
   id: string
   title: string
   messages: Message[]
+  // Whether messages have been fetched from the database
+  loaded?: boolean
 }
 
 export interface State {
@@ -21,7 +24,7 @@ export interface State {
   conversations: Conversation[]
   currentConversationId: string | null
   isLoading: boolean
-  isBannerVisible: boolean
+  selectedModel: string
 }
 
 const initialState: State = {
@@ -29,10 +32,30 @@ const initialState: State = {
   conversations: [],
   currentConversationId: null,
   isLoading: false,
-  isBannerVisible: true
+  selectedModel: DEFAULT_MODEL
 }
 
 export const store = new Store<State>(initialState)
+
+// Persist prompts and model choice in the browser
+const SETTINGS_KEY = 'chat-settings'
+
+export function hydrateSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')
+    store.setState(state => ({
+      ...state,
+      prompts: Array.isArray(saved.prompts) ? saved.prompts : state.prompts,
+      selectedModel: typeof saved.selectedModel === 'string' ? saved.selectedModel : state.selectedModel
+    }))
+  } catch {
+    // Ignore malformed settings
+  }
+  return store.subscribe(() => {
+    const { prompts, selectedModel } = store.state
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ prompts, selectedModel }))
+  })
+}
 
 export const actions = {
   // Prompt actions
@@ -97,18 +120,8 @@ export const actions = {
   addConversation: (conversation: Conversation) => {
     store.setState(state => ({
       ...state,
-      conversations: [...state.conversations, conversation],
+      conversations: [conversation, ...state.conversations],
       currentConversationId: conversation.id
-    }))
-  },
-
-  updateConversationId: (oldId: string, newId: string) => {
-    store.setState(state => ({
-      ...state,
-      conversations: state.conversations.map(conv =>
-        conv.id === oldId ? { ...conv, id: newId } : conv
-      ),
-      currentConversationId: state.currentConversationId === oldId ? newId : state.currentConversationId
     }))
   },
 
@@ -129,6 +142,26 @@ export const actions = {
     }))
   },
 
+  setMessages: (conversationId: string, messages: Message[]) => {
+    store.setState(state => ({
+      ...state,
+      conversations: state.conversations.map(conv =>
+        conv.id === conversationId ? { ...conv, messages, loaded: true } : conv
+      )
+    }))
+  },
+
+  removeMessages: (conversationId: string, ids: string[]) => {
+    store.setState(state => ({
+      ...state,
+      conversations: state.conversations.map(conv =>
+        conv.id === conversationId
+          ? { ...conv, messages: conv.messages.filter(m => !ids.includes(m.id)) }
+          : conv
+      )
+    }))
+  },
+
   addMessage: (conversationId: string, message: Message) => {
     store.setState(state => ({
       ...state,
@@ -136,7 +169,7 @@ export const actions = {
         conv.id === conversationId
           ? { ...conv, messages: [...conv.messages, message] }
           : conv
-      )
+      ).sort((a, b) => (a.id === conversationId ? -1 : b.id === conversationId ? 1 : 0))
     }))
   },
 
@@ -144,8 +177,8 @@ export const actions = {
     store.setState(state => ({ ...state, isLoading }))
   },
 
-  setBannerVisible: (isBannerVisible: boolean) => {
-    store.setState(state => ({ ...state, isBannerVisible }))
+  setSelectedModel: (selectedModel: string) => {
+    store.setState(state => ({ ...state, selectedModel }))
   }
 }
 
@@ -158,5 +191,5 @@ export const selectors = {
   getConversations: (state: State) => state.conversations,
   getCurrentConversationId: (state: State) => state.currentConversationId,
   getIsLoading: (state: State) => state.isLoading,
-  getIsBannerVisible: (state: State) => state.isBannerVisible
+  getSelectedModel: (state: State) => state.selectedModel
 } 

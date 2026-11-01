@@ -8,7 +8,6 @@ import {
   ChatInput,
   Sidebar,
   WelcomeScreen,
-  TopBanner
 } from '../components'
 import { useConversations, useAppState, store, actions } from '../store'
 import { genAIResponse, type Message } from '../utils'
@@ -25,7 +24,7 @@ function Home() {
     addMessage,
   } = useConversations()
   
-  const { isLoading, setLoading, getActivePrompt } = useAppState()
+  const { isLoading, setLoading, getActivePrompt, selectedModel } = useAppState()
 
   // Memoize messages to prevent unnecessary re-renders
   const messages = useMemo(() => currentConversation?.messages || [], [currentConversation]);
@@ -84,6 +83,7 @@ function Home() {
         data: {
           messages: [...messages, userMessage],
           systemPrompt,
+          model: selectedModel,
         },
       })
 
@@ -192,7 +192,7 @@ function Home() {
       }
       await addMessage(conversationId, errorMessage)
     }
-  }, [messages, getActivePrompt, addMessage]);
+  }, [messages, getActivePrompt, addMessage, selectedModel]);
 
   const handleSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault()
@@ -322,7 +322,6 @@ function Home() {
 
       {/* Main Content */}
       <div className="flex flex-col flex-1">
-        <TopBanner />
         {error && (
           <p className="w-full max-w-3xl p-4 mx-auto font-bold text-orange-500">{error}</p>
         )}

@@ -1,14 +1,29 @@
 import { useStore } from '@tanstack/react-store';
 import { v4 as uuidv4 } from 'uuid';
-import { actions, selectors, store, type Conversation } from './store';
-import { useMutation, useQuery } from 'convex/react';
-import { api } from '../../convex/_generated/api';
-import type { Id } from '../../convex/_generated/dataModel';
+import { actions, hydrateSettings, selectors, store, type Conversation } from './store';
 import type { Message } from '../utils/ai';
+import {
+  createConversation,
+  deleteConversation as deleteConversationFn,
+  deleteMessages,
+  getMessages,
+  listConversations,
+  renameConversation,
+  saveMessage,
+} from '../utils/chat-db';
 import { useEffect } from 'react';
 
-// Check if Convex URL is provided
-const isConvexAvailable = Boolean(import.meta.env.VITE_CONVEX_URL);
+// Anonymous per-browser ID that scopes saved conversations
+const CLIENT_ID_KEY = 'chat-client-id';
+
+export function getClientId() {
+  let id = localStorage.getItem(CLIENT_ID_KEY);
+  if (!id) {
+    id = uuidv4();
+    localStorage.setItem(CLIENT_ID_KEY, id);
+  }
+  return id;
+}
 
 // Original app hook that matches the interface expected by the app
 export function useAppState() {
@@ -16,14 +31,14 @@ export function useAppState() {
   const conversations = useStore(store, s => selectors.getConversations(s));
   const currentConversationId = useStore(store, s => selectors.getCurrentConversationId(s));
   const prompts = useStore(store, s => selectors.getPrompts(s));
-  const isBannerVisible = useStore(store, s => selectors.getIsBannerVisible(s));
+  const selectedModel = useStore(store, s => selectors.getSelectedModel(s));
 
   return {
     conversations,
     currentConversationId,
     isLoading,
     prompts,
-    isBannerVisible,
+    selectedModel,
 
     // Actions
     setCurrentConversationId: actions.setCurrentConversationId,
@@ -32,7 +47,7 @@ export function useAppState() {
     updateConversationTitle: actions.updateConversationTitle,
     addMessage: actions.addMessage,
     setLoading: actions.setLoading,
-    setBannerVisible: actions.setBannerVisible,
+    setSelectedModel: actions.setSelectedModel,
     createPrompt: actions.createPrompt,
     deletePrompt: actions.deletePrompt,
     setPromptActive: actions.setPromptActive,
@@ -43,123 +58,93 @@ export function useAppState() {
   };
 }
 
-// Hook for Convex integration with fallback to local state
+// Hook for conversations saved in Netlify Database
 export function useConversations() {
-  // Local state for UI reactivity
   const conversations = useStore(store, s => selectors.getConversations(s));
   const currentConversationId = useStore(store, s => selectors.getCurrentConversationId(s));
   const currentConversation = useStore(store, s => selectors.getCurrentConversation(s));
-  
-  // Only use Convex if it's available
-  const convexConversations = isConvexAvailable 
-    ? useQuery(api.conversations.list) || []
-    : null;
-  
-  // Convex mutations (only if Convex is available)
-  const createConversation = isConvexAvailable ? useMutation(api.conversations.create) : null;
-  const updateTitle = isConvexAvailable ? useMutation(api.conversations.updateTitle) : null;
-  const deleteConversation = isConvexAvailable ? useMutation(api.conversations.remove) : null;
-  const addMessageToConversation = isConvexAvailable ? useMutation(api.conversations.addMessage) : null;
-  
-  // Convert Convex conversations to local format if available
+
+  // Load settings and the conversation list once in the browser
   useEffect(() => {
-    if (isConvexAvailable && convexConversations && convexConversations.length > 0) {
-      const formattedConversations: Conversation[] = convexConversations.map(conv => ({
-        id: conv._id,
-        title: conv.title,
-        messages: conv.messages as Message[],
-      }));
-      
-      actions.setConversations(formattedConversations);
+    const unsubscribe = hydrateSettings();
+    listConversations({ data: { clientId: getClientId() } })
+      .then((list) => {
+        const local = store.state.conversations;
+        const merged: Conversation[] = [
+          ...local.filter(c => !list.some(l => l.id === c.id)),
+          ...list.map(l => local.find(c => c.id === l.id) ?? { ...l, messages: [] }),
+        ];
+        actions.setConversations(merged);
+      })
+      .catch((error) => console.error('Failed to load conversations:', error));
+    return unsubscribe;
+  }, []);
+
+  // Fetch messages the first time a saved conversation is opened
+  useEffect(() => {
+    if (!currentConversation || currentConversation.loaded || currentConversation.messages.length > 0) {
+      return;
     }
-  }, [convexConversations]);
-  
+    const id = currentConversation.id;
+    getMessages({ data: { clientId: getClientId(), conversationId: id } })
+      .then((msgs) => actions.setMessages(id, msgs))
+      .catch((error) => console.error('Failed to load messages:', error));
+  }, [currentConversation]);
+
   return {
     conversations,
     currentConversationId,
     currentConversation,
-    
+
     setCurrentConversationId: (id: string | null) => {
       actions.setCurrentConversationId(id);
     },
-    
+
     createNewConversation: async (title: string = 'New Conversation') => {
       const id = uuidv4();
-      const newConversation: Conversation = {
-        id,
-        title,
-        messages: [],
-      };
-      
-      // First update local state for immediate UI feedback
-      actions.addConversation(newConversation);
-      
-      // Then create in Convex database if available
-      if (isConvexAvailable && createConversation) {
-        try {
-          const convexId = await createConversation({
-            title,
-            messages: [],
-          });
-          
-          // Update the local conversation with the Convex ID
-          actions.updateConversationId(id, convexId);
-          actions.setCurrentConversationId(convexId);
-          
-          return convexId;
-        } catch (error) {
-          console.error('Failed to create conversation in Convex:', error);
-        }
+      actions.addConversation({ id, title, messages: [], loaded: true });
+      try {
+        await createConversation({ data: { clientId: getClientId(), id, title } });
+      } catch (error) {
+        console.error('Failed to save conversation:', error);
       }
-      
-      // If Convex is not available or there was an error, just use the local ID
-      actions.setCurrentConversationId(id);
       return id;
     },
-    
+
     updateConversationTitle: async (id: string, title: string) => {
-      // First update local state
       actions.updateConversationTitle(id, title);
-      
-      // Then update in Convex if available
-      if (isConvexAvailable && updateTitle) {
-        try {
-          await updateTitle({ id: id as Id<'conversations'>, title });
-        } catch (error) {
-          console.error('Failed to update conversation title in Convex:', error);
-        }
+      try {
+        await renameConversation({ data: { clientId: getClientId(), id, title } });
+      } catch (error) {
+        console.error('Failed to rename conversation:', error);
       }
     },
-    
+
     deleteConversation: async (id: string) => {
-      // First update local state
       actions.deleteConversation(id);
-      
-      // Then delete from Convex if available
-      if (isConvexAvailable && deleteConversation) {
-        try {
-          await deleteConversation({ id: id as Id<'conversations'> });
-        } catch (error) {
-          console.error('Failed to delete conversation from Convex:', error);
-        }
+      try {
+        await deleteConversationFn({ data: { clientId: getClientId(), id } });
+      } catch (error) {
+        console.error('Failed to delete conversation:', error);
       }
     },
-    
+
     addMessage: async (conversationId: string, message: Message) => {
-      // First update local state
       actions.addMessage(conversationId, message);
-      
-      // Then add to Convex if available
-      if (isConvexAvailable && addMessageToConversation) {
-        try {
-          await addMessageToConversation({
-            conversationId: conversationId as Id<'conversations'>,
-            message,
-          });
-        } catch (error) {
-          console.error('Failed to add message to Convex:', error);
-        }
+      try {
+        await saveMessage({ data: { clientId: getClientId(), conversationId, message } });
+      } catch (error) {
+        console.error('Failed to save message:', error);
+      }
+    },
+
+    removeMessages: async (conversationId: string, ids: string[]) => {
+      actions.removeMessages(conversationId, ids);
+      try {
+        await deleteMessages({ data: { clientId: getClientId(), conversationId, ids } });
+      } catch (error) {
+        console.error('Failed to delete messages:', error);
       }
     },
   };
-} 
+}

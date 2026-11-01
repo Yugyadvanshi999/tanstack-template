@@ -1,5 +1,6 @@
 import { createServerFn } from '@tanstack/react-start'
 import { Anthropic } from '@anthropic-ai/sdk'
+import { DEFAULT_MODEL, MODELS } from './models'
 
 export interface Message {
   id: string
@@ -7,7 +8,7 @@ export interface Message {
   content: string
 }
 
-const DEFAULT_SYSTEM_PROMPT = `You are TanStack Chat, an AI assistant using Markdown for clear and structured responses. Format your responses following these guidelines:
+const DEFAULT_SYSTEM_PROMPT = `You are a highly capable, friendly AI assistant. Give accurate, thoughtful, genuinely helpful answers: think through problems carefully, say so when you are unsure instead of guessing, and match the length of your answer to the question. Use Markdown for clear and structured responses. Format your responses following these guidelines:
 
 1. Use headers for sections:
    # For main topics
@@ -47,135 +48,142 @@ const DEFAULT_SYSTEM_PROMPT = `You are TanStack Chat, an AI assistant using Mark
    - Use inline \`code\` for technical terms
    - Include example usage where helpful
 
-Keep responses concise and well-structured. Use appropriate Markdown formatting to enhance readability and understanding.`
+Keep responses well-structured and no longer than they need to be. Use appropriate Markdown formatting to enhance readability and understanding.`
 
-// Non-streaming implementation
-export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
+// Roughly 4 characters per token; keep well under the 200k token context window
+// so arbitrarily long conversations keep working by dropping the oldest turns.
+const MAX_CONTEXT_CHARS = 400_000
+
+const trimToContext = (msgs: Array<{ role: Message['role']; content: string }>) => {
+  let total = 0
+  let start = msgs.length
+  while (start > 0 && total + msgs[start - 1].content.length <= MAX_CONTEXT_CHARS) {
+    total += msgs[start - 1].content.length
+    start--
+  }
+  // Always keep at least the latest message, and start on a user turn
+  let trimmed = msgs.slice(Math.min(start, msgs.length - 1))
+  while (trimmed.length > 1 && trimmed[0].role !== 'user') trimmed = trimmed.slice(1)
+  return trimmed
+}
+
+const errorResponse = (error: string, status: number) =>
+  new Response(JSON.stringify({ error }), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+// Streaming implementation
+export const genAIResponse = createServerFn({ method: 'POST', response: 'raw' })
   .inputValidator(
     (d: {
       messages: Array<Message>
       systemPrompt?: { value: string; enabled: boolean }
+      model?: string
     }) => d,
   )
-  // .middleware([loggingMiddleware])
   .handler(async ({ data }) => {
-    // Check for API key in environment variables
-    // This should ONLY use server-side environment variables (no VITE_ prefix)
-    const apiKey = process.env.ANTHROPIC_API_KEY
+    // Netlify AI Gateway injects credentials automatically
+    const anthropic = new Anthropic({ timeout: 10 * 60 * 1000 })
 
-    if (!apiKey) {
-      throw new Error(
-        'Missing API key: Please set ANTHROPIC_API_KEY in your environment variables or .env file.'
-      )
-    }
-
-    // Create Anthropic client with proper configuration
-    // Don't set baseURL - Netlify AI Gateway will intercept requests to api.anthropic.com automatically
-    const anthropic = new Anthropic({
-      apiKey,
-      // Add proper timeout to avoid connection issues
-      timeout: 30000 // 30 seconds timeout
-    })
+    const model = MODELS.some((m) => m.id === data.model) ? data.model! : DEFAULT_MODEL
 
     // Filter out error messages and empty messages
-    const formattedMessages = data.messages
-      .filter(
-        (msg) =>
-          msg.content.trim() !== '' &&
-          !msg.content.startsWith('Sorry, I encountered an error'),
-      )
-      .map((msg) => ({
-        role: msg.role,
-        content: msg.content.trim(),
-      }))
+    const formattedMessages = trimToContext(
+      data.messages
+        .filter(
+          (msg) =>
+            msg.content.trim() !== '' &&
+            !msg.content.startsWith('Sorry, I encountered an error'),
+        )
+        .map((msg) => ({
+          role: msg.role,
+          content: msg.content.trim(),
+        })),
+    )
 
     if (formattedMessages.length === 0) {
-      return new Response(JSON.stringify({ error: 'No valid messages to send' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      })
+      return errorResponse('No valid messages to send', 400)
     }
 
     const systemPrompt = data.systemPrompt?.enabled
       ? `${DEFAULT_SYSTEM_PROMPT}\n\n${data.systemPrompt.value}`
       : DEFAULT_SYSTEM_PROMPT
 
-    // Debug log to verify prompt layering
-    console.log('System Prompt Configuration:', {
-      hasCustomPrompt: data.systemPrompt?.enabled,
-      customPromptValue: data.systemPrompt?.value,
-      finalPrompt: systemPrompt,
-    })
-
     try {
-      const stream = await anthropic.messages.stream({
-        model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 4096,
+      const stream = anthropic.messages.stream({
+        model,
+        max_tokens: 32000,
         system: systemPrompt,
         messages: formattedMessages,
       })
 
-      // Transform the Anthropic stream to match the expected client format
-      // The client reads chunks and expects each chunk to contain one complete JSON object
+      // Each line of the response body is one JSON object
       const encoder = new TextEncoder()
+      const send = (controller: ReadableStreamDefaultController, chunk: object) =>
+        controller.enqueue(encoder.encode(JSON.stringify(chunk) + '\n'))
+
       const transformedStream = new ReadableStream({
         async start(controller) {
           try {
             for await (const event of stream) {
-              // Only send content_block_delta events with text
               if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-                const chunk = {
+                send(controller, {
                   type: 'content_block_delta',
-                  delta: {
-                    type: 'text_delta',
-                    text: event.delta.text,
-                  },
-                }
-                // Encode each JSON object as a separate chunk
-                // This ensures the decoder can parse each chunk independently
-                controller.enqueue(encoder.encode(JSON.stringify(chunk) + '\n'))
+                  delta: { type: 'text_delta', text: event.delta.text },
+                })
               }
             }
             controller.close()
           } catch (error) {
             console.error('Stream error:', error)
-            controller.error(error)
+            send(controller, { type: 'error', error: describeError(error) })
+            controller.close()
           }
+        },
+        cancel() {
+          stream.abort()
         },
       })
 
       return new Response(transformedStream, {
-        headers: {
-          'Content-Type': 'application/x-ndjson',
-        },
+        headers: { 'Content-Type': 'application/x-ndjson' },
       })
     } catch (error) {
       console.error('Error in genAIResponse:', error)
-      
-      // Error handling with specific messages
-      let errorMessage = 'Failed to get AI response'
-      let statusCode = 500
-      
-      if (error instanceof Error) {
-        if (error.message.includes('rate limit')) {
-          errorMessage = 'Rate limit exceeded. Please try again in a moment.'
-        } else if (error.message.includes('Connection error') || error.name === 'APIConnectionError') {
-          errorMessage = 'Connection to Anthropic API failed. Please check your internet connection and API key.'
-          statusCode = 503 // Service Unavailable
-        } else if (error.message.includes('authentication')) {
-          errorMessage = 'Authentication failed. Please check your Anthropic API key.'
-          statusCode = 401 // Unauthorized
-        } else {
-          errorMessage = error.message
-        }
-      }
-      
-      return new Response(JSON.stringify({ 
-        error: errorMessage,
-        details: error instanceof Error ? error.name : undefined
-      }), {
-        status: statusCode,
-        headers: { 'Content-Type': 'application/json' },
-      })
+      return errorResponse(describeError(error), 500)
     }
-  }) 
+  })
+
+function describeError(error: unknown) {
+  if (error instanceof Anthropic.RateLimitError) {
+    return 'The AI is getting a lot of requests right now. Please try again in a moment.'
+  }
+  if (error instanceof Anthropic.APIConnectionError) {
+    return 'Could not reach the AI service. Please try again.'
+  }
+  if (error instanceof Error) return error.message
+  return 'Failed to get AI response'
+}
+
+// Short title for a new conversation, generated by a fast model
+export const genTitle = createServerFn({ method: 'POST' })
+  .inputValidator((d: { text: string }) => ({ text: String(d.text).slice(0, 2000) }))
+  .handler(async ({ data }) => {
+    try {
+      const anthropic = new Anthropic()
+      const result = await anthropic.messages.create({
+        model: 'claude-haiku-5-5',
+        max_tokens: 30,
+        system:
+          'Write a short title (2-6 words) for a chat that starts with the user message below. Reply with the title only, no quotes or punctuation at the end.',
+        messages: [{ role: 'user', content: data.text }],
+      })
+      const block = result.content.find((b) => b.type === 'text')
+      const title = block && block.type === 'text' ? block.text.trim().replace(/^["']|["'.]$/g, '') : ''
+      return { title: title.slice(0, 80) }
+    } catch (error) {
+      console.error('Error generating title:', error)
+      return { title: '' }
+    }
+  })
